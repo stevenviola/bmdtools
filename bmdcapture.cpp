@@ -374,11 +374,10 @@ void write_data_packet(char *data, int size, int64_t pts)
     avpacket_queue_put(&queue, &pkt);
 }
 
-void write_audio_packet(IDeckLinkAudioInputPacket *audioFrame)
+void write_audio_packet(IDeckLinkAudioInputPacket *audioFrame, int64_t pts)
 {
     AVCodecContext *c;
     AVPacket pkt;
-    BMDTimeValue audio_pts;
     void *audioFrameBytes;
 
     av_init_packet(&pkt);
@@ -388,16 +387,8 @@ void write_audio_packet(IDeckLinkAudioInputPacket *audioFrame)
     pkt.size = audioFrame->GetSampleFrameCount() *
                g_audioChannels * (g_audioSampleDepth / 8);
     audioFrame->GetBytes(&audioFrameBytes);
-    audioFrame->GetPacketTime(&audio_pts, audio_st->time_base.den);
-    pkt.pts = audio_pts / audio_st->time_base.num;
-
-    if (initial_audio_pts == AV_NOPTS_VALUE) {
-        initial_audio_pts = pkt.pts;
-    }
-
-    pkt.pts -= initial_audio_pts;
-    pkt.dts = pkt.pts;
-
+    pkt.dts = pkt.pts = pts;
+   
     pkt.flags       |= AV_PKT_FLAG_KEY;
     pkt.stream_index = audio_st->index;
     pkt.data         = (uint8_t *)audioFrameBytes;
@@ -480,26 +471,25 @@ void write_video_packet(IDeckLinkVideoInputFrame *videoFrame,
 HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
     IDeckLinkVideoInputFrame *videoFrame, IDeckLinkAudioInputPacket *audioFrame)
 {
-
     frameCount++;
 
+    int64_t video_pts;
+    int64_t audio_pts;
     // Handle Video Frame
     if (videoFrame) {
         BMDTimeValue frameTime;
         BMDTimeValue frameDuration;
-        int64_t pts;
         videoFrame->GetStreamTime(&frameTime, &frameDuration,
                                   video_st->time_base.den);
 
-        pts = frameTime / video_st->time_base.num;
+        video_pts = frameTime;
 
         if (initial_video_pts == AV_NOPTS_VALUE) {
-            initial_video_pts = pts;
+            initial_video_pts = video_pts;
         }
 
-        pts -= initial_video_pts;
-
-        write_video_packet(videoFrame, pts, frameDuration);
+        video_pts -= initial_video_pts;
+        write_video_packet(videoFrame, video_pts, frameDuration);
 
         if (serial_fd > 0) {
             char line[8] = {0};
@@ -507,21 +497,38 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
             if (count > 0)
                 fprintf(stderr, "read %d bytes: %s  \n", count, line);
             else line[0] = ' ';
-            write_data_packet(line, 7, pts);
+            write_data_packet(line, 7, video_pts);
         }
 
         if (wallclock) {
             int64_t t = av_gettime();
             char line[20];
             snprintf(line, sizeof(line), "%" PRId64, t);
-            write_data_packet(line, strlen(line), pts);
+            write_data_packet(line, strlen(line), video_pts);
         }
     }
 
     // Handle Audio Frame
-    if (audioFrame)
-        write_audio_packet(audioFrame);
-
+    if (audioFrame) {
+        BMDTimeValue audio_frame_time;
+        audioFrame->GetPacketTime(&audio_frame_time, audio_st->time_base.den);
+        audio_pts = audio_frame_time;
+        if (initial_audio_pts == AV_NOPTS_VALUE) {
+            initial_audio_pts = audio_pts;
+        }
+        audio_pts -= initial_audio_pts;
+        write_audio_packet(audioFrame, audio_pts);
+    }
+    
+    if (audioFrame && videoFrame) {
+       printf("[%ld]\tAudio PTS: %ld; Video PTS: %ld; PTS Diff: %ld\n",
+              frameCount,
+              AV_TIME_BASE*audio_pts/audio_st->time_base.den,
+              AV_TIME_BASE*video_pts/video_st->time_base.den,
+              (AV_TIME_BASE*video_pts/video_st->time_base.den) - 
+              (AV_TIME_BASE*audio_pts/audio_st->time_base.den)
+       );
+    }
 
     return S_OK;
 }
